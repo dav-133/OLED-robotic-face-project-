@@ -1,1 +1,792 @@
 
+// Declare Button before Arduino's automatic function-prototype generation.
+// This prevents the IDE from generating buttonPressed(Button&) before Button exists.
+struct Button {
+  int pin;
+  bool stable;
+  bool reading;
+  unsigned long changedAt;
+  unsigned long pressedAt;
+  bool longHandled;
+  bool longEvent;
+};
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <time.h>
+
+// SH1106 128x64 OLED, I2C
+// If your OLED is SSD1306, change this constructor.
+U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(
+  U8G2_R0, U8X8_PIN_NONE
+);
+
+// Existing wiring
+const int TOUCH_PIN  = 32;
+const int BTN_DOWN   = 18;
+const int BTN_SELECT = 19;
+const int LED1       = 23;
+const int LED2       = 16;
+const int BUZZER     = 25;
+
+// Nairobi, Kenya: East Africa Time (UTC+3), no daylight-saving time.
+// Replace these placeholders with your Wi-Fi network details.
+const char* WIFI_SSID = "Q-DEVELOPER";
+const char* WIFI_PASSWORD = "Fauna@2026";
+
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.google.com";
+
+unsigned long lastWiFiAttempt = 0;
+bool ntpConfigured = false;
+
+void maintainWiFiTime() {
+  unsigned long now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!ntpConfigured) {
+      configTzTime("EAT-3", NTP_SERVER_1, NTP_SERVER_2);
+      ntpConfigured = true;
+      Serial.println("Wi-Fi connected. Synchronising Nairobi time...");
+    }
+    return;
+  }
+
+  // Retry every 30 seconds without blocking the robot interface.
+  if (now - lastWiFiAttempt >= 30000UL) {
+    lastWiFiAttempt = now;
+
+    // Avoid trying to connect if the placeholder credentials are unchanged.
+    if (String(WIFI_SSID) == "YOUR_WIFI_NAME") {
+      return;
+    }
+
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+}
+
+bool readLocalTime(struct tm &timeInfo) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return false;  // Clock has not been synchronised yet.
+  localtime_r(&now, &timeInfo);
+  return true;
+}
+
+void drawClockHeader() {
+  struct tm timeInfo;
+  char dateText[12];
+  char timeText[12];
+
+  oled.setFont(u8g2_font_5x7_tf);
+
+  if (readLocalTime(timeInfo)) {
+    strftime(dateText, sizeof(dateText), "%d/%m/%y", &timeInfo);
+    strftime(timeText, sizeof(timeText), "%H:%M:%S", &timeInfo);
+  } else {
+    snprintf(dateText, sizeof(dateText), "--/--/--");
+    snprintf(timeText, sizeof(timeText), "--:--:--");
+  }
+
+  oled.drawStr(1, 8, dateText);
+  oled.drawStr(87, 8, timeText);
+}
+
+
+enum Screen {
+  HOME,
+  MENU,
+  FACE_STUDIO,
+  SOUND_LAB,
+  LED_LAB,
+  GAMES,
+  STATUS_SCREEN,
+  SETTINGS
+};
+
+enum Mood {
+  HAPPY,
+  CURIOUS,
+  SLEEPY,
+  ANGRY
+};
+
+Screen screen = HOME;
+Mood mood = HAPPY;
+
+const char* menuItems[] = {
+  "Robot Face",
+  "Face Studio",
+  "Sound Lab",
+  "LED Lab",
+  "Reaction Game",
+  "System Status",
+  "Settings"
+};
+
+const int MENU_COUNT = 7;
+
+int menuIndex = 0;
+int soundIndex = 0;
+int ledMode = 0;
+int eyeStyle = 0;
+int pupilX = 0;
+int gameState = 0;
+unsigned long gameResult = 0;
+
+bool sleeping = false;
+bool blinkEnabled = true;
+bool blinking = false;
+bool ledState = false;
+bool touchWasActive = false;
+
+unsigned long lastBlink = 0;
+unsigned long blinkStarted = 0;
+unsigned long lastLook = 0;
+unsigned long lastFrame = 0;
+unsigned long lastLED = 0;
+unsigned long gameStart = 0;
+unsigned long gameDelay = 0;
+
+// Debounced button handling
+
+Button downBtn = {
+  BTN_DOWN, HIGH, HIGH, 0, 0, false, false
+};
+
+Button selectBtn = {
+  BTN_SELECT, HIGH, HIGH, 0, 0, false, false
+};
+
+bool buttonPressed(Button &b) {
+  bool raw = digitalRead(b.pin);
+  unsigned long now = millis();
+
+  b.longEvent = false;
+
+  if (raw != b.reading) {
+    b.reading = raw;
+    b.changedAt = now;
+  }
+
+  if (now - b.changedAt >= 30 && raw != b.stable) {
+    b.stable = raw;
+
+    if (b.stable == LOW) {
+      b.pressedAt = now;
+      b.longHandled = false;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool buttonLongPress(Button &b) {
+  if (b.stable == LOW &&
+      !b.longHandled &&
+      millis() - b.pressedAt >= 700) {
+    b.longHandled = true;
+    return true;
+  }
+  return false;
+}
+
+void beep(int frequency, int duration) {
+  tone(BUZZER, frequency, duration);
+}
+
+void header(const char* title) {
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(2, 9, title);
+  oled.drawHLine(0, 12, 128);
+}
+
+void drawEye(int x, int offset, bool closed) {
+  const int y = 17;
+
+  if (closed) {
+    oled.drawLine(x + 3, y + 17, x + 40, y + 17);
+    oled.drawLine(x + 7, y + 20, x + 36, y + 20);
+    return;
+  }
+
+  if (eyeStyle == 0) {
+    oled.drawRBox(x, y, 43, 34, 10);
+
+    oled.setDrawColor(0);
+    oled.drawDisc(x + 21 + offset, y + 17, 9);
+    oled.drawDisc(x + 18 + offset, y + 13, 2);
+    oled.setDrawColor(1);
+  } else {
+    oled.drawDisc(x + 21, y + 17, 17);
+
+    oled.setDrawColor(0);
+    oled.drawDisc(x + 21 + offset, y + 17, 8);
+    oled.drawDisc(x + 18 + offset, y + 13, 2);
+    oled.setDrawColor(1);
+  }
+}
+
+void drawMouth() {
+  switch (mood) {
+    case HAPPY:
+      oled.drawLine(54, 54, 59, 59);
+      oled.drawLine(59, 59, 69, 59);
+      oled.drawLine(69, 59, 74, 54);
+      break;
+
+    case CURIOUS:
+      oled.drawCircle(64, 56, 4);
+      break;
+
+    case SLEEPY:
+      oled.drawLine(56, 57, 72, 57);
+      break;
+
+    case ANGRY:
+      oled.drawLine(54, 59, 74, 54);
+      break;
+  }
+}
+
+void drawFace() {
+  oled.clearBuffer();
+  drawClockHeader();
+
+  if (sleeping) {
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(4, 23, "SLEEP MODE");
+    oled.drawStr(91, 23, "Zzz");
+
+    oled.drawLine(12, 34, 51, 34);
+    oled.drawLine(77, 34, 116, 34);
+    oled.drawLine(57, 54, 71, 54);
+
+    oled.drawStr(12, 63, "TOUCH OR SELECT");
+    oled.sendBuffer();
+    return;
+  }
+
+  drawEye(8, pupilX, blinking || mood == SLEEPY);
+  drawEye(77, pupilX, blinking || mood == SLEEPY);
+
+  if (mood == ANGRY) {
+    oled.drawLine(9, 16, 49, 21);
+    oled.drawLine(79, 21, 119, 16);
+  } else if (mood == CURIOUS) {
+    oled.drawLine(10, 14, 49, 14);
+    oled.drawLine(80, 14, 118, 19);
+  }
+
+  drawMouth();
+
+  oled.drawPixel(63, 2);
+  oled.sendBuffer();
+}
+
+void nextMood() {
+  mood = static_cast<Mood>((mood + 1) % 4);
+
+  const int notes[] = {1300, 1700, 600, 400};
+  beep(notes[mood], 90);
+}
+
+void goHome() {
+  screen = HOME;
+  sleeping = false;
+  beep(900, 35);
+}
+
+void openMenu() {
+  screen = MENU;
+  menuIndex = 0;
+  beep(1000, 35);
+}
+
+void drawMenu() {
+  oled.clearBuffer();
+  header("ROBOT MENU");
+
+  for (int i = 0; i < 5; i++) {
+    int idx = (menuIndex + i) % MENU_COUNT;
+    int y = 23 + i * 9;
+
+    if (i == 0) {
+      oled.drawBox(0, y - 7, 128, 9);
+      oled.setDrawColor(0);
+      oled.drawStr(4, y, ">");
+      oled.drawStr(14, y, menuItems[idx]);
+      oled.setDrawColor(1);
+    } else {
+      oled.drawStr(14, y, menuItems[idx]);
+    }
+  }
+
+  oled.sendBuffer();
+}
+
+void drawFaceStudio() {
+  oled.clearBuffer();
+  header("FACE STUDIO");
+
+  oled.setFont(u8g2_font_6x10_tf);
+
+  const char* names[] = {
+    "HAPPY", "CURIOUS", "SLEEPY", "ANGRY"
+  };
+
+  oled.drawStr(2, 25, "Mood:");
+  oled.drawStr(48, 25, names[mood]);
+
+  oled.drawStr(2, 38, "Eyes:");
+  oled.drawStr(48, 38, eyeStyle == 0 ? "ROUND" : "CIRCLE");
+
+  oled.drawStr(2, 51, "Auto blink:");
+  oled.drawStr(72, 51, blinkEnabled ? "ON" : "OFF");
+
+  oled.drawStr(2, 63, "DOWN: mood  HOLD: home");
+  oled.sendBuffer();
+}
+
+void drawSoundLab() {
+  oled.clearBuffer();
+  header("SOUND LAB");
+
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(4, 25, "Choose a sound:");
+
+  oled.drawStr(4, 38,
+    soundIndex == 0 ? "> Happy beep" : "  Happy beep");
+  oled.drawStr(4, 49,
+    soundIndex == 1 ? "> Alert tone" : "  Alert tone");
+  oled.drawStr(4, 60,
+    soundIndex == 2 ? "> Short tune" : "  Short tune");
+
+  oled.sendBuffer();
+}
+
+void playSound() {
+  if (soundIndex == 0) {
+    beep(1500, 100);
+  } else if (soundIndex == 1) {
+    beep(600, 300);
+  } else {
+    beep(900, 100);
+    delay(120);
+    beep(1200, 100);
+    delay(120);
+    beep(1600, 150);
+  }
+}
+
+void drawLEDLab() {
+  oled.clearBuffer();
+  header("LED LAB");
+
+  const char* modes[] = {
+    "Alternating", "Both ON",
+    "Both OFF", "Fast flashing"
+  };
+
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(4, 30, "Pattern:");
+  oled.drawStr(4, 44, modes[ledMode]);
+  oled.drawStr(4, 60, "DOWN: next pattern");
+
+  oled.sendBuffer();
+}
+
+void updateLEDs() {
+  unsigned long now = millis();
+  unsigned long interval = ledMode == 3 ? 100 : 350;
+
+  if (now - lastLED < interval) return;
+  lastLED = now;
+  ledState = !ledState;
+
+  if (screen == LED_LAB) {
+    switch (ledMode) {
+      case 0:
+        digitalWrite(LED1, ledState);
+        digitalWrite(LED2, !ledState);
+        break;
+      case 1:
+        digitalWrite(LED1, HIGH);
+        digitalWrite(LED2, HIGH);
+        break;
+      case 2:
+        digitalWrite(LED1, LOW);
+        digitalWrite(LED2, LOW);
+        break;
+      case 3:
+        digitalWrite(LED1, ledState);
+        digitalWrite(LED2, ledState);
+        break;
+    }
+  } else {
+    digitalWrite(LED1, ledState);
+    digitalWrite(LED2, !ledState);
+  }
+}
+
+void drawGame() {
+  oled.clearBuffer();
+  header("REACTION GAME");
+
+  oled.setFont(u8g2_font_6x10_tf);
+
+  if (gameState == 0) {
+    oled.drawStr(4, 29, "Press SELECT");
+    oled.drawStr(4, 42, "Wait for GO!");
+    oled.drawStr(4, 59, "Then react quickly");
+  } else if (gameState == 1) {
+    oled.drawStr(4, 35, "Wait...");
+  } else if (gameState == 2) {
+    oled.setFont(u8g2_font_helvB14_tf);
+    oled.drawStr(32, 40, "GO!");
+  } else if (gameState == 3) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%lu ms", gameResult);
+
+    oled.drawStr(4, 32, "Reaction time:");
+    oled.setFont(u8g2_font_helvB14_tf);
+    oled.drawStr(4, 53, buf);
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(4, 63, "SELECT: retry");
+  } else {
+    oled.drawStr(4, 35, "Too early!");
+    oled.drawStr(4, 58, "SELECT: retry");
+  }
+
+  oled.sendBuffer();
+}
+
+void startGame() {
+  gameState = 1;
+  gameDelay = random(1500, 5000);
+  gameStart = millis();
+  beep(700, 50);
+}
+
+void drawStatusScreen() {
+  oled.clearBuffer();
+  header("SYSTEM STATUS");
+
+  oled.setFont(u8g2_font_5x7_tf);
+  struct tm timeInfo;
+  char dateText[20];
+  char timeText[20];
+
+  if (readLocalTime(timeInfo)) {
+    strftime(dateText, sizeof(dateText), "%d/%m/%Y", &timeInfo);
+    strftime(timeText, sizeof(timeText), "%H:%M:%S EAT", &timeInfo);
+  } else {
+    snprintf(dateText, sizeof(dateText), "Waiting for time...");
+    snprintf(timeText, sizeof(timeText), "--:--:-- EAT");
+  }
+
+  oled.drawStr(2, 23, "Nairobi, Kenya");
+  oled.drawStr(2, 33, dateText);
+  oled.drawStr(2, 43, timeText);
+  oled.drawStr(2, 53, WiFi.status() == WL_CONNECTED ? "Wi-Fi: connected" : "Wi-Fi: offline");
+  char uptimeBuf[24];
+  snprintf(uptimeBuf, sizeof(uptimeBuf), "Uptime: %lus", millis() / 1000);
+  oled.drawStr(2, 63, uptimeBuf);
+
+  oled.sendBuffer();
+}
+
+void drawSettings() {
+  oled.clearBuffer();
+  header("SETTINGS");
+
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(3, 26, "Eye style:");
+  oled.drawStr(83, 26, eyeStyle == 0 ? "ROUND" : "CIRCLE");
+
+  oled.drawStr(3, 40, "Auto blink:");
+  oled.drawStr(83, 40, blinkEnabled ? "ON" : "OFF");
+
+  oled.drawStr(3, 57, "DOWN: eyes");
+  oled.drawStr(3, 63, "SELECT: blink");
+
+  oled.sendBuffer();
+}
+
+void chooseMenuItem() {
+  switch (menuIndex) {
+    case 0: screen = HOME; break;
+    case 1: screen = FACE_STUDIO; break;
+    case 2: screen = SOUND_LAB; break;
+    case 3: screen = LED_LAB; break;
+    case 4:
+      screen = GAMES;
+      gameState = 0;
+      break;
+    case 5: screen = STATUS_SCREEN; break;
+    case 6: screen = SETTINGS; break;
+  }
+
+  beep(1200, 35);
+}
+
+void handleTouch() {
+  bool touched = digitalRead(TOUCH_PIN);
+
+  if (touched && !touchWasActive) {
+    switch (screen) {
+      case HOME:
+        if (sleeping) {
+          sleeping = false;
+          mood = HAPPY;
+          beep(1400, 90);
+        } else {
+          nextMood();
+        }
+        break;
+
+      case FACE_STUDIO:
+        nextMood();
+        break;
+
+      case SOUND_LAB:
+        playSound();
+        break;
+
+      case LED_LAB:
+        ledMode = (ledMode + 1) % 4;
+        beep(1000, 35);
+        break;
+
+      case GAMES:
+        if (gameState == 2) {
+          gameResult = millis() - gameStart;
+          gameState = 3;
+          beep(1600, 100);
+        } else if (gameState == 1) {
+          gameState = 4;
+          beep(300, 200);
+        } else {
+          startGame();
+        }
+        break;
+
+      case SETTINGS:
+        eyeStyle = !eyeStyle;
+        break;
+
+      default:
+        goHome();
+        break;
+    }
+  }
+
+  touchWasActive = touched;
+}
+
+void handleDown() {
+  if (!buttonPressed(downBtn)) return;
+
+  switch (screen) {
+    case HOME:
+      openMenu();
+      break;
+
+    case MENU:
+      menuIndex = (menuIndex + 1) % MENU_COUNT;
+      beep(800, 25);
+      break;
+
+    case FACE_STUDIO:
+      nextMood();
+      break;
+
+    case SOUND_LAB:
+      soundIndex = (soundIndex + 1) % 3;
+      beep(800, 25);
+      break;
+
+    case LED_LAB:
+      ledMode = (ledMode + 1) % 4;
+      beep(800, 25);
+      break;
+
+    case SETTINGS:
+      eyeStyle = !eyeStyle;
+      beep(800, 25);
+      break;
+
+    default:
+      break;
+  }
+}
+
+void handleSelect() {
+  bool clicked = buttonPressed(selectBtn);
+
+  if (buttonLongPress(selectBtn)) {
+    goHome();
+    return;
+  }
+
+  if (!clicked) return;
+
+  switch (screen) {
+    case HOME:
+      if (sleeping) {
+        sleeping = false;
+        beep(1300, 70);
+      } else {
+        openMenu();
+      }
+      break;
+
+    case MENU:
+      chooseMenuItem();
+      break;
+
+    case FACE_STUDIO:
+      blinkEnabled = !blinkEnabled;
+      break;
+
+    case SOUND_LAB:
+      playSound();
+      break;
+
+    case LED_LAB:
+      ledMode = (ledMode + 1) % 4;
+      break;
+
+    case GAMES:
+      if (gameState == 0 || gameState == 3 || gameState == 4) {
+        startGame();
+      } else if (gameState == 1) {
+        gameState = 4;
+        beep(300, 180);
+      } else if (gameState == 2) {
+        gameResult = millis() - gameStart;
+        gameState = 3;
+        beep(1600, 90);
+      }
+      break;
+
+    case STATUS_SCREEN:
+      goHome();
+      break;
+
+    case SETTINGS:
+      blinkEnabled = !blinkEnabled;
+      break;
+  }
+}
+
+void updateAnimations() {
+  unsigned long now = millis();
+
+  if (screen == HOME && !sleeping) {
+    if (blinkEnabled && !blinking &&
+        now - lastBlink >= 3000) {
+      blinking = true;
+      blinkStarted = now;
+    }
+
+    if (blinking && now - blinkStarted >= 160) {
+      blinking = false;
+      lastBlink = now;
+    }
+
+    if (now - lastLook >= 900) {
+      pupilX = random(-4, 5);
+      lastLook = now;
+    }
+  } else {
+    blinking = false;
+  }
+
+  if (screen == GAMES && gameState == 1 &&
+      now - gameStart >= gameDelay) {
+    gameState = 2;
+    gameStart = now;
+    beep(1800, 100);
+  }
+}
+
+void drawCurrentScreen() {
+  switch (screen) {
+    case HOME:
+      drawFace();
+      break;
+    case MENU:
+      drawMenu();
+      break;
+    case FACE_STUDIO:
+      drawFaceStudio();
+      break;
+    case SOUND_LAB:
+      drawSoundLab();
+      break;
+    case LED_LAB:
+      drawLEDLab();
+      break;
+    case GAMES:
+      drawGame();
+      break;
+    case STATUS_SCREEN:
+      drawStatusScreen();
+      break;
+    case SETTINGS:
+      drawSettings();
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+
+  Wire.begin(21, 22);
+  oled.begin();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  lastWiFiAttempt = millis() - 30000UL; // Start the first connection attempt immediately.
+  maintainWiFiTime();
+
+  randomSeed(micros());
+
+  lastBlink = millis();
+  lastLook = millis();
+
+  beep(1300, 100);
+  drawCurrentScreen();
+}
+
+void loop() {
+  maintainWiFiTime();
+
+  handleDown();
+  handleSelect();
+  handleTouch();
+
+  updateAnimations();
+  updateLEDs();
+
+  if (millis() - lastFrame >= 45) {
+    lastFrame = millis();
+    drawCurrentScreen();
+  }
+}
